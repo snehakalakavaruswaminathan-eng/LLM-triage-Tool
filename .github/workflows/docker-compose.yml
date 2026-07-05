@@ -1,0 +1,63 @@
+#Build the Docker Image
+- name: Build AI Service
+  run: |
+    docker build -t llm-triage ./ai-service
+#Start the FastAPI Container
+- name: Start AI Service
+  env:
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  run: |
+    docker run -d \
+      --name llm-triage \
+      -p 8000:8000 \
+      -e OPENAI_API_KEY=$OPENAI_API_KEY \
+      llm-triage
+#Wait for the Service
+- name: Wait for API
+  run: |
+    sleep 10
+- name: Wait for Health Check
+  run: |
+    for i in {1..15}; do
+      if curl -f http://localhost:8000/health; then
+        exit 0
+      fi
+      echo "Waiting..."
+      sleep 2
+    done
+    exit 1
+#Test the Health Endpoint
+- name: Test Health
+  run: |
+    curl http://localhost:8000/health
+ - name: Call LLM Triage
+ #invoke the API
+  run: |
+    curl -X POST http://localhost:8000/triage \
+      -H "Content-Type: application/json" \
+      -d '{
+        "report_path":"reports/consolidated_report.json"
+      }'  
+ #- name: Verify Output
+  run: |
+    docker exec llm-triage ls -R /app/reports
+    Verify the Report Was Generated
+#Upload the Report
+- name: Copy Report
+  run: |
+    docker cp llm-triage:/app/reports/ai_triage_report.json .
+
+- name: Upload AI Report
+  uses: actions/upload-artifact@v4
+  with:
+    name: ai-triage-report
+    path: ai_triage_report.json
+#Stop the Container
+- name: Stop Container
+  if: always()
+  run: |
+    docker stop llm-triage
+    docker rm llm-triage
+    
+
+    
