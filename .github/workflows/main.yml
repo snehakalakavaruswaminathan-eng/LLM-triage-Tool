@@ -20,6 +20,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+    - name: Debug Repository Structure
+      run: |
+        echo "Current Directory:"
+        pwd
+        echo "Repository Root:"
+        ls -la
+        echo "Directory Tree:"
+        find . -maxdepth 3 -type d
 
       - name: Install dependencies
         run: |
