@@ -1,0 +1,221 @@
+name: Security Scan + AI Triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_live_llm:
+        description: "Use OpenAI instead of mock LLM"
+        type: boolean
+        default: false
+      create_draft_prs:
+        description: "Create draft GitHub PRs for top-3 fixes"
+        type: boolean
+        default: false
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+
+env:
+  SCAN_TARGET: scan-target
+  SCANNER_OUTPUT: scanner-output
+  JUICE_SHOP_URL: http://localhost:3000
+
+jobs:
+  security-scan-and-triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout capstone repo
+        uses: actions/checkout@v4
+
+      - name: Checkout OWASP Juice Shop
+        uses: actions/checkout@v4
+        with:
+          repository: juice-shop/juice-shop
+          path: ${{ env.SCAN_TARGET }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        working-directory: ai-service
+        run: pip install -r requirements.txt
+
+      - name: Install scanner tools
+        run: |
+          pip install semgrep checkov
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Create scanner output directory
+        run: mkdir -p "${{ env.SCANNER_OUTPUT }}"
+
+      - name: Run Semgrep
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config=p/security-audit \
+            --config=p/javascript \
+            --json \
+            --output "${{ env.SCANNER_OUTPUT }}/semgrep.json" \
+            "${{ env.SCAN_TARGET }}" || echo "Semgrep finished with findings or warnings"
+
+      - name: Run Trivy filesystem scan
+        continue-on-error: true
+        run: |
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --format json \
+            --output "${{ env.SCANNER_OUTPUT }}/trivy.json" \
+            "${{ env.SCAN_TARGET }}" || echo "Trivy finished with findings"
+
+      - name: Run Checkov
+        continue-on-error: true
+        run: |
+          checkov \
+            -d "${{ env.SCAN_TARGET }}" \
+            --framework dockerfile,yaml,json \
+            --output json \
+            --output-file-path "${{ env.SCANNER_OUTPUT }}/checkov.json" \
+            --quiet || echo "Checkov finished with findings"
+
+      - name: Run Gitleaks
+        continue-on-error: true
+        run: |
+          gitleaks detect \
+            --source "${{ env.SCAN_TARGET }}" \
+            --no-git \
+            --report-format json \
+            --report-path "${{ env.SCANNER_OUTPUT }}/gitleaks.json" \
+            --exit-code 0
+
+      - name: Start Juice Shop for ZAP
+        run: docker compose up -d juice-shop
+
+      - name: Wait for Juice Shop
+        run: |
+          for i in {1..30}; do
+            if curl -sf "${{ env.JUICE_SHOP_URL }}" > /dev/null; then
+              echo "Juice Shop is up"
+              exit 0
+            fi
+            echo "Waiting for Juice Shop... ($i/30)"
+            sleep 5
+          done
+          echo "Juice Shop failed to start"
+          exit 1
+
+      - name: Run OWASP ZAP baseline scan
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ env.JUICE_SHOP_URL }}
+          cmd_options: "-J -j"
+          artifact_name: zap_report
+
+      - name: Collect ZAP JSON report
+        continue-on-error: true
+        run: |
+          if [ -f zap_report.json ]; then
+            cp zap_report.json "${{ env.SCANNER_OUTPUT }}/zap.json"
+          elif [ -f report_json.json ]; then
+            cp report_json.json "${{ env.SCANNER_OUTPUT }}/zap.json"
+          else
+            echo '{"site":[{"@name":"http://localhost:3000","alerts":[]}]}' > "${{ env.SCANNER_OUTPUT }}/zap.json"
+            echo "ZAP JSON not found; wrote empty placeholder"
+          fi
+
+      - name: Ensure all scanner outputs exist
+        run: |
+          for file in semgrep.json trivy.json checkov.json gitleaks.json zap.json; do
+            if [ ! -s "${{ env.SCANNER_OUTPUT }}/$file" ]; then
+              echo "Creating empty placeholder for $file"
+              if [ "$file" = "gitleaks.json" ]; then
+                echo "[]" > "${{ env.SCANNER_OUTPUT }}/$file"
+              else
+                echo "{}" > "${{ env.SCANNER_OUTPUT }}/$file"
+              fi
+            fi
+          done
+          ls -la "${{ env.SCANNER_OUTPUT }}"
+
+      - name: Configure LLM and PR options
+        run: |
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ]; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.use_live_llm }}" != "true" ]; then
+              echo "LLM_MOCK_MODE=true" >> "$GITHUB_ENV"
+            else
+              echo "LLM_MOCK_MODE=false" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "LLM_MOCK_MODE=true" >> "$GITHUB_ENV"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.create_draft_prs }}" = "true" ]; then
+            echo "CREATE_DRAFT_PRS=true" >> "$GITHUB_ENV"
+          else
+            echo "CREATE_DRAFT_PRS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Aggregate reports and run AI triage
+        working-directory: ai-service
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_BASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          EXTRA_ARGS=""
+          if [ "$CREATE_DRAFT_PRS" = "true" ]; then
+            EXTRA_ARGS="--create-draft-prs"
+          fi
+
+          python scripts/run_triage.py \
+            "../${{ env.SCANNER_OUTPUT }}/semgrep.json" \
+            "../${{ env.SCANNER_OUTPUT }}/trivy.json" \
+            "../${{ env.SCANNER_OUTPUT }}/checkov.json" \
+            "../${{ env.SCANNER_OUTPUT }}/gitleaks.json" \
+            "../${{ env.SCANNER_OUTPUT }}/zap.json" \
+            --scan-id "${{ github.run_id }}" \
+            --repository "juice-shop/juice-shop" \
+            $EXTRA_ARGS
+
+      - name: Publish GitHub Step Summary
+        if: always()
+        run: |
+          echo "## Security Scan + AI Triage" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Output |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Scanners | Semgrep, Trivy, Checkov, Gitleaks, ZAP |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | OWASP Juice Shop |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f ai-service/reports/report.md ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            head -n 60 ai-service/reports/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload scanner artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-reports
+          path: |
+            scanner-output/
+            ai-service/reports/
+            ai-service/patches/
+
+      - name: Stop Juice Shop
+        if: always()
+        run: docker compose down
